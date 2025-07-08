@@ -113,48 +113,19 @@ func (a *Analyzer) AnalyzePullRequest(ctx context.Context, owner, repo string, n
 	}
 
 	// Check for existing reviews
-	reviews, err := a.gh.ListReviews(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("listing reviews: %w", err)
-	}
-	
-	for _, review := range reviews {
-		if review.State != nil && (*review.State == constants.ReviewStateApproved || *review.State == constants.ReviewStateChangesRequested || *review.State == constants.ReviewStateCommented) {
-			result.Approvable = false
-			result.Reason = "PR has existing reviews"
-			result.Details = append(result.Details, fmt.Sprintf("Review by %s: %s", review.User.GetLogin(), review.GetState()))
-			return result, nil
-		}
+	if reason, details := a.checkExistingReviews(ctx, owner, repo, number); reason != "" {
+		result.Approvable = false
+		result.Reason = reason
+		result.Details = details
+		return result, nil
 	}
 
-	// Check for comments from collaborators
-	issueComments, err := a.gh.ListIssueComments(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("listing issue comments: %w", err)
-	}
-	
-	for _, comment := range issueComments {
-		if comment.AuthorAssociation != nil && isCollaborator(*comment.AuthorAssociation) {
-			result.Approvable = false
-			result.Reason = "PR has comments from collaborators"
-			result.Details = append(result.Details, fmt.Sprintf("Comment by %s (%s)", comment.User.GetLogin(), *comment.AuthorAssociation))
-			return result, nil
-		}
-	}
-	
-	// Check PR review comments
-	prComments, err := a.gh.ListPullRequestComments(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("listing PR comments: %w", err)
-	}
-	
-	for _, comment := range prComments {
-		if comment.AuthorAssociation != nil && isCollaborator(*comment.AuthorAssociation) {
-			result.Approvable = false
-			result.Reason = "PR has review comments from collaborators"
-			result.Details = append(result.Details, fmt.Sprintf("Review comment by %s (%s)", comment.User.GetLogin(), *comment.AuthorAssociation))
-			return result, nil
-		}
+	// Check for comments from collaborators  
+	if reason, details := a.checkCollaboratorComments(ctx, owner, repo, number); reason != "" {
+		result.Approvable = false
+		result.Reason = reason
+		result.Details = details
+		return result, nil
 	}
 
 	// Check first-time contributor
@@ -199,44 +170,107 @@ func (a *Analyzer) AnalyzePullRequest(ctx context.Context, owner, repo string, n
 		}
 	}
 
-	// Analyze with Gemini if enabled
+	// Analyze content of changes
+	if reason, details := a.analyzeChangeContent(ctx, files); reason != "" {
+		result.Approvable = false
+		result.Reason = reason
+		result.Details = append(result.Details, details...)
+		return result, nil
+	}
+
+	// If we got here, all content analysis passed
+	if len(result.Details) > 0 {
+		result.Reason = "All checks passed"
+	}
+
+	return result, nil
+}
+
+// checkExistingReviews checks if there are any existing reviews on the PR
+func (a *Analyzer) checkExistingReviews(ctx context.Context, owner, repo string, number int) (string, []string) {
+	reviews, err := a.gh.ListReviews(ctx, owner, repo, number)
+	if err != nil {
+		// Return error as reason but don't fail the analysis
+		return fmt.Sprintf("Error checking reviews: %v", err), nil
+	}
+	
+	for _, review := range reviews {
+		if review.State != nil && (*review.State == constants.ReviewStateApproved || 
+			*review.State == constants.ReviewStateChangesRequested || 
+			*review.State == constants.ReviewStateCommented) {
+			return "PR has existing reviews", []string{
+				fmt.Sprintf("Review by %s: %s", review.User.GetLogin(), review.GetState()),
+			}
+		}
+	}
+	return "", nil
+}
+
+// checkCollaboratorComments checks for comments from collaborators
+func (a *Analyzer) checkCollaboratorComments(ctx context.Context, owner, repo string, number int) (string, []string) {
+	// Check issue comments
+	issueComments, err := a.gh.ListIssueComments(ctx, owner, repo, number)
+	if err != nil {
+		return fmt.Sprintf("Error checking issue comments: %v", err), nil
+	}
+	
+	for _, comment := range issueComments {
+		if comment.AuthorAssociation != nil && isCollaborator(*comment.AuthorAssociation) {
+			return "PR has comments from collaborators", []string{
+				fmt.Sprintf("Comment by %s (%s)", comment.User.GetLogin(), *comment.AuthorAssociation),
+			}
+		}
+	}
+	
+	// Check PR review comments
+	prComments, err := a.gh.ListPullRequestComments(ctx, owner, repo, number)
+	if err != nil {
+		return fmt.Sprintf("Error checking PR comments: %v", err), nil
+	}
+	
+	for _, comment := range prComments {
+		if comment.AuthorAssociation != nil && isCollaborator(*comment.AuthorAssociation) {
+			return "PR has review comments from collaborators", []string{
+				fmt.Sprintf("Review comment by %s (%s)", comment.User.GetLogin(), *comment.AuthorAssociation),
+			}
+		}
+	}
+	
+	return "", nil
+}
+
+// analyzeChangeContent analyzes the actual content of the changes using Gemini or basic heuristics
+func (a *Analyzer) analyzeChangeContent(ctx context.Context, files []*github.CommitFile) (string, []string) {
+	var details []string
+	
 	if a.config.UseGemini && a.gemini != nil {
 		geminiResult, err := a.analyzeWithGemini(ctx, files)
 		if err != nil {
 			// Don't fail if Gemini analysis fails, just log it
-			result.Details = append(result.Details, fmt.Sprintf("Gemini analysis failed: %v", err))
+			details = append(details, fmt.Sprintf("Gemini analysis failed: %v", err))
 		} else {
 			if geminiResult.AltersBehavior {
-				result.Approvable = false
-				result.Reason = "Changes alter application behavior"
-				result.Details = append(result.Details, geminiResult.Reason)
-				return result, nil
+				return "Changes alter application behavior", []string{geminiResult.Reason}
 			}
 			
 			if !geminiResult.IsImprovement {
-				result.Approvable = false
-				result.Reason = "Changes do not appear to be an improvement"
-				result.Details = append(result.Details, geminiResult.Reason)
-				return result, nil
+				return "Changes do not appear to be an improvement", []string{geminiResult.Reason}
 			}
 
 			if geminiResult.IsTrivial {
-				result.Details = append(result.Details, fmt.Sprintf("Trivial change detected: %s", geminiResult.Category))
+				details = append(details, fmt.Sprintf("Trivial change detected: %s", geminiResult.Category))
 			}
 		}
 	} else {
 		// Without Gemini, do basic trivial change detection
 		isTrivial, category := a.detectTrivialChanges(files)
 		if !isTrivial {
-			result.Approvable = false
-			result.Reason = "Cannot verify change is trivial without AI analysis"
-			return result, nil
+			return "Cannot verify change is trivial without AI analysis", nil
 		}
-		result.Details = append(result.Details, fmt.Sprintf("Trivial change detected: %s", category))
+		details = append(details, fmt.Sprintf("Trivial change detected: %s", category))
 	}
-
-	result.Reason = "All checks passed"
-	return result, nil
+	
+	return "", details
 }
 
 // isStatusPassing checks if the combined status is passing.

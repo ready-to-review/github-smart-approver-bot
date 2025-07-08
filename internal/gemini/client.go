@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"text/template"
 
 	"github.com/google/generative-ai-go/genai"
+	"github.com/thegroove/trivial-auto-approve/internal/errors"
+	"github.com/thegroove/trivial-auto-approve/internal/retry"
 	"google.golang.org/api/option"
 )
 
@@ -23,12 +26,16 @@ var _ API = (*Client)(nil)
 func NewClient(ctx context.Context) (*Client, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		return nil, fmt.Errorf("GEMINI_API_KEY environment variable not set")
+		return nil, errors.ErrNoGeminiKey
 	}
 
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return nil, fmt.Errorf("creating Gemini client: %w", err)
+		return nil, &errors.APIError{
+			Service: "Gemini",
+			Method:  "NewClient",
+			Err:     err,
+		}
 	}
 
 	// Use Gemini 2.0 Flash as specified
@@ -53,9 +60,23 @@ func (c *Client) Close() error {
 func (c *Client) AnalyzePRChanges(ctx context.Context, files []FileChange) (*AnalysisResult, error) {
 	prompt := buildAnalysisPrompt(files)
 	
-	resp, err := c.model.GenerateContent(ctx, genai.Text(prompt))
+	var resp *genai.GenerateContentResponse
+	err := retry.Do(ctx, 3, func() error {
+		var err error
+		resp, err = c.model.GenerateContent(ctx, genai.Text(prompt))
+		if err != nil && retry.IsRetryable(err) {
+			return err
+		} else if err != nil {
+			return &errors.APIError{
+				Service: "Gemini",
+				Method:  "GenerateContent",
+				Err:     err,
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("generating content: %w", err)
+		return nil, err
 	}
 
 	if len(resp.Candidates) == 0 {
@@ -99,26 +120,52 @@ Focus on semantic changes, not just syntactic ones.
 
 Respond in a structured format.`
 
-func buildAnalysisPrompt(files []FileChange) string {
-	var sb strings.Builder
-	sb.WriteString("Analyze the following pull request changes:\n\n")
-	
-	for _, file := range files {
-		sb.WriteString(fmt.Sprintf("File: %s\n", file.Filename))
-		sb.WriteString(fmt.Sprintf("Additions: %d, Deletions: %d\n", file.Additions, file.Deletions))
-		sb.WriteString("Patch:\n```\n")
-		sb.WriteString(file.Patch)
-		sb.WriteString("\n```\n\n")
-	}
-	
-	sb.WriteString(`
+var analysisPromptTemplate = template.Must(template.New("analysis").Parse(`
+Analyze the following pull request changes:
+
+{{range .Files}}
+File: {{.Filename}}
+Additions: {{.Additions}}, Deletions: {{.Deletions}}
+Patch:
+` + "```" + `
+{{.Patch}}
+` + "```" + `
+
+{{end}}
 Please analyze these changes and respond with:
 1. ALTERS_BEHAVIOR: YES/NO
 2. IS_IMPROVEMENT: YES/NO
 3. IS_TRIVIAL: YES/NO
 4. CATEGORY: typo/comment/markdown/lint/other
 5. REASON: Brief explanation of your analysis
-`)
+`))
+
+func buildAnalysisPrompt(files []FileChange) string {
+	var sb strings.Builder
+	data := struct {
+		Files []FileChange
+	}{
+		Files: files,
+	}
+	
+	if err := analysisPromptTemplate.Execute(&sb, data); err != nil {
+		// Fallback to simple format if template fails
+		sb.Reset()
+		sb.WriteString("Analyze the following pull request changes:\n\n")
+		for _, file := range files {
+			sb.WriteString(fmt.Sprintf("File: %s\n", file.Filename))
+			sb.WriteString(fmt.Sprintf("Additions: %d, Deletions: %d\n", file.Additions, file.Deletions))
+			sb.WriteString("Patch:\n```\n")
+			sb.WriteString(file.Patch)
+			sb.WriteString("\n```\n\n")
+		}
+		sb.WriteString("\nPlease analyze these changes and respond with:\n")
+		sb.WriteString("1. ALTERS_BEHAVIOR: YES/NO\n")
+		sb.WriteString("2. IS_IMPROVEMENT: YES/NO\n")
+		sb.WriteString("3. IS_TRIVIAL: YES/NO\n")
+		sb.WriteString("4. CATEGORY: typo/comment/markdown/lint/other\n")
+		sb.WriteString("5. REASON: Brief explanation of your analysis\n")
+	}
 	
 	return sb.String()
 }

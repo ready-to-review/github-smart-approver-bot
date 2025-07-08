@@ -9,6 +9,7 @@ import (
 	"github.com/google/go-github/v68/github"
 	"github.com/thegroove/trivial-auto-approve/internal/constants"
 	"github.com/thegroove/trivial-auto-approve/internal/errors"
+	"github.com/thegroove/trivial-auto-approve/internal/retry"
 	"golang.org/x/oauth2"
 )
 
@@ -21,7 +22,7 @@ type Client struct {
 func NewClient(ctx context.Context) (*Client, error) {
 	token, err := getGHToken()
 	if err != nil {
-		return nil, fmt.Errorf("getting gh token: %w", err)
+		return nil, err
 	}
 
 	ts := oauth2.StaticTokenSource(
@@ -59,11 +60,23 @@ func getGHToken() (string, error) {
 
 // GetPullRequest retrieves a pull request by owner, repo, and number.
 func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error) {
-	pr, _, err := c.client.PullRequests.Get(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("getting PR %s/%s#%d: %w", owner, repo, number, err)
-	}
-	return pr, nil
+	var pr *github.PullRequest
+	err := retry.Do(ctx, 3, func() error {
+		var err error
+		pr, _, err = c.client.PullRequests.Get(ctx, owner, repo, number)
+		if err != nil && retry.IsRetryable(err) {
+			return err
+		} else if err != nil {
+			// Non-retryable error, wrap and return
+			return &errors.APIError{
+				Service: "GitHub",
+				Method:  fmt.Sprintf("GetPullRequest %s/%s#%d", owner, repo, number),
+				Err:     err,
+			}
+		}
+		return nil
+	})
+	return pr, err
 }
 
 // ListOrgPullRequests lists all open pull requests for an organization.
@@ -80,7 +93,11 @@ func (c *Client) ListOrgPullRequests(ctx context.Context, org string) ([]*github
 	for {
 		result, resp, err := c.client.Search.Issues(ctx, query, opt)
 		if err != nil {
-			return nil, fmt.Errorf("searching PRs: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "Search.Issues",
+				Err:     err,
+			}
 		}
 
 		for _, issue := range result.Issues {
@@ -117,7 +134,11 @@ func (c *Client) GetPullRequestFiles(ctx context.Context, owner, repo string, nu
 	for {
 		files, resp, err := c.client.PullRequests.ListFiles(ctx, owner, repo, number, opt)
 		if err != nil {
-			return nil, fmt.Errorf("listing PR files: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "PullRequests.ListFiles",
+				Err:     err,
+			}
 		}
 		
 		allFiles = append(allFiles, files...)
@@ -133,11 +154,22 @@ func (c *Client) GetPullRequestFiles(ctx context.Context, owner, repo string, nu
 
 // GetCombinedStatus retrieves the combined status for a PR.
 func (c *Client) GetCombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error) {
-	status, _, err := c.client.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
-	if err != nil {
-		return nil, fmt.Errorf("getting combined status: %w", err)
-	}
-	return status, nil
+	var status *github.CombinedStatus
+	err := retry.Do(ctx, 3, func() error {
+		var err error
+		status, _, err = c.client.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
+		if err != nil && retry.IsRetryable(err) {
+			return err
+		} else if err != nil {
+			return &errors.APIError{
+				Service: "GitHub",
+				Method:  "Repositories.GetCombinedStatus",
+				Err:     err,
+			}
+		}
+		return nil
+	})
+	return status, err
 }
 
 // IsFirstTimeContributor checks if the PR author is a first-time contributor.
@@ -145,7 +177,11 @@ func (c *Client) IsFirstTimeContributor(ctx context.Context, owner, repo, author
 	query := fmt.Sprintf("repo:%s/%s author:%s is:pr", owner, repo, author)
 	result, _, err := c.client.Search.Issues(ctx, query, nil)
 	if err != nil {
-		return false, fmt.Errorf("searching contributor PRs: %w", err)
+		return false, &errors.APIError{
+			Service: "GitHub",
+			Method:  "Search.Issues",
+			Err:     err,
+		}
 	}
 	
 	// If they have only 1 PR (the current one), they're a first-timer
@@ -161,7 +197,11 @@ func (c *Client) ApprovePullRequest(ctx context.Context, owner, repo string, num
 	
 	_, _, err := c.client.PullRequests.CreateReview(ctx, owner, repo, number, review)
 	if err != nil {
-		return fmt.Errorf("creating review: %w", err)
+		return &errors.APIError{
+			Service: "GitHub",
+			Method:  "PullRequests.CreateReview",
+			Err:     err,
+		}
 	}
 	
 	return nil
@@ -175,7 +215,11 @@ func (c *Client) MergePullRequest(ctx context.Context, owner, repo string, numbe
 	
 	_, _, err := c.client.PullRequests.Merge(ctx, owner, repo, number, "", options)
 	if err != nil {
-		return fmt.Errorf("merging PR: %w", err)
+		return &errors.APIError{
+			Service: "GitHub",
+			Method:  "PullRequests.Merge",
+			Err:     err,
+		}
 	}
 	
 	return nil
@@ -189,7 +233,11 @@ func (c *Client) ListReviews(ctx context.Context, owner, repo string, number int
 	for {
 		reviews, resp, err := c.client.PullRequests.ListReviews(ctx, owner, repo, number, opt)
 		if err != nil {
-			return nil, fmt.Errorf("listing reviews: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "PullRequests.ListReviews",
+				Err:     err,
+			}
 		}
 		
 		allReviews = append(allReviews, reviews...)
@@ -213,7 +261,11 @@ func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, numb
 	for {
 		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, number, opt)
 		if err != nil {
-			return nil, fmt.Errorf("listing issue comments: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "Issues.ListComments",
+				Err:     err,
+			}
 		}
 		
 		allComments = append(allComments, comments...)
@@ -237,7 +289,11 @@ func (c *Client) ListPullRequestComments(ctx context.Context, owner, repo string
 	for {
 		comments, resp, err := c.client.PullRequests.ListComments(ctx, owner, repo, number, opt)
 		if err != nil {
-			return nil, fmt.Errorf("listing PR comments: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "PullRequests.ListComments",
+				Err:     err,
+			}
 		}
 		
 		allComments = append(allComments, comments...)
@@ -264,7 +320,11 @@ func (c *Client) ListRepoPullRequests(ctx context.Context, owner, repo string) (
 	for {
 		prs, resp, err := c.client.PullRequests.List(ctx, owner, repo, opt)
 		if err != nil {
-			return nil, fmt.Errorf("listing repo PRs: %w", err)
+			return nil, &errors.APIError{
+				Service: "GitHub",
+				Method:  "PullRequests.List",
+				Err:     err,
+			}
 		}
 		
 		allPRs = append(allPRs, prs...)
@@ -300,7 +360,11 @@ func ParsePullRequestURL(url string) (owner, repo string, number int, err error)
 		repo = parts[4]
 		_, err = fmt.Sscanf(parts[6], "%d", &number)
 		if err != nil {
-			return "", "", 0, fmt.Errorf("parsing PR number: %w", err)
+			return "", "", 0, &errors.ValidationError{
+				Field: "url",
+				Value: parts[6],
+				Msg:   "invalid PR number",
+			}
 		}
 	} else if strings.Contains(url, "#") {
 		parts := strings.Split(url, "#")
@@ -321,7 +385,11 @@ func ParsePullRequestURL(url string) (owner, repo string, number int, err error)
 		repo = repoParts[1]
 		_, err = fmt.Sscanf(parts[1], "%d", &number)
 		if err != nil {
-			return "", "", 0, fmt.Errorf("parsing PR number: %w", err)
+			return "", "", 0, &errors.ValidationError{
+				Field: "url",
+				Value: parts[1],
+				Msg:   "invalid PR number",
+			}
 		}
 	} else {
 		return "", "", 0, errors.ErrInvalidPRURL
