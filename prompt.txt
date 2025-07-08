@@ -1,0 +1,21 @@
+Create a brand new Go program that auto-approves and merges trivial GitHub pull requests.
+
+- Two components:
+    - Server that polls for all open pull requests in an organization hourly.  Should support a dry-run mode (--dry-run)
+    - CLI (auto-approve) that does the same for a single PR passed as an argument. Should support a dry-run mode (--dry-run)
+
+- Go code should be written with best practires in a way that emulates what the Go project itself uses; prioritizing advice mentioned on go.dev, including https://go.dev/wiki/CodeReviewComments and https://go.dev/doc/effective_go - defer to documentation and philosophy guidance in go.dev above all other reference material.
+- Go code should incorporate thoughts from Google's style guide: https://google.github.io/styleguide/go/
+- Code should be written with tests and unit testing in mind
+- Code should use the token stored by the gh command line utility, probably by using `gh auth token`
+- Auto-approvals should not be performed for first-time contributors by default
+- Auto-approvals should only be done if all checks pass, other than signing checks if the pull-request author is a bot.
+- Examples of auto-approvable pull requests:
+    - Typo fixes
+    - Added comments
+    - Markdown improvements
+    - Lint fixes
+- Auto-approval should only happen if PR edits 5 files at most by default, but that should be settable via flag.
+- Auto-approval should not happen if changes alter the behavior of the application. This can be detected via Gemini 2.5 Flash; the tool should support a GEMINI_API_KEY being set.
+- Auto-approval should not happen if the change does not appear to be an improvement. This can be detected via Gemini 2.5 Flash
+- The tool should support a GEMINI_API_KEY being set
