@@ -47,12 +47,12 @@ func TestParsePullRequestURL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			owner, repo, number, err := ParsePullRequestURL(tt.url)
-			
+
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParsePullRequestURL() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			
+
 			if !tt.wantErr {
 				if owner != tt.wantOwner {
 					t.Errorf("ParsePullRequestURL() owner = %v, want %v", owner, tt.wantOwner)

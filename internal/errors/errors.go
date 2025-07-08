@@ -10,15 +10,21 @@ import (
 var (
 	// ErrNoGitHubToken indicates that no GitHub authentication token was found.
 	ErrNoGitHubToken = errors.New("no GitHub token found")
-	
+
 	// ErrNoGeminiKey indicates that the GEMINI_API_KEY environment variable is not set.
 	ErrNoGeminiKey = errors.New("GEMINI_API_KEY environment variable not set")
-	
+
 	// ErrInvalidPRURL indicates that the provided PR URL could not be parsed.
 	ErrInvalidPRURL = errors.New("invalid pull request URL format")
-	
+
 	// ErrPRNotOpen indicates that the PR is not in an open state.
 	ErrPRNotOpen = errors.New("pull request is not open")
+
+	// ErrPRReadyToMerge indicates that a PR is already in clean status and ready to merge.
+	ErrPRReadyToMerge = errors.New("PR is already in clean status and ready to merge")
+
+	// ErrBranchUpToDate indicates that the branch is already up to date.
+	ErrBranchUpToDate = errors.New("branch already up to date")
 )
 
 // ValidationError represents an error in configuration or input validation.
