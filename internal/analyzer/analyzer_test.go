@@ -382,11 +382,11 @@ type mockGitHubAPI struct {
 	files       []*github.CommitFile
 }
 
-func (m *mockGitHubAPI) GetAuthenticatedUser(ctx context.Context) (*github.User, error) {
+func (m *mockGitHubAPI) AuthenticatedUser(ctx context.Context) (*github.User, error) {
 	return m.currentUser, nil
 }
 
-func (m *mockGitHubAPI) GetPullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error) {
+func (m *mockGitHubAPI) PullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error) {
 	if m.pr != nil {
 		return m.pr, nil
 	}
@@ -403,14 +403,14 @@ func (m *mockGitHubAPI) ListRepoPullRequests(ctx context.Context, owner, repo st
 	return nil, nil
 }
 
-func (m *mockGitHubAPI) GetPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error) {
+func (m *mockGitHubAPI) PullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error) {
 	if m.files != nil {
 		return m.files, nil
 	}
 	return nil, nil
 }
 
-func (m *mockGitHubAPI) GetCombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error) {
+func (m *mockGitHubAPI) CombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error) {
 	return nil, nil
 }
 
@@ -444,6 +444,23 @@ func (m *mockGitHubAPI) MergePullRequest(ctx context.Context, owner, repo string
 
 func (m *mockGitHubAPI) UpdateBranch(ctx context.Context, owner, repo string, number int) error {
 	return nil
+}
+
+func (m *mockGitHubAPI) ListAppInstallations(ctx context.Context) ([]*github.Installation, error) {
+	return nil, nil
+}
+
+func (m *mockGitHubAPI) ListUserRepositories(ctx context.Context, user string) ([]*github.Repository, error) {
+	return nil, nil
+}
+
+func (m *mockGitHubAPI) ListUserPullRequests(ctx context.Context, user string) ([]*github.PullRequest, error) {
+	return nil, nil
+}
+
+func (m *mockGitHubAPI) GetUserPermissionLevel(ctx context.Context, owner, repo, username string) (string, error) {
+	// Mock implementation - return "write" for all users
+	return "write", nil
 }
 
 func TestCheckExistingReviews(t *testing.T) {

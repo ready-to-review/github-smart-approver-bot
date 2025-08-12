@@ -4,24 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"text/template"
 
 	"github.com/google/generative-ai-go/genai"
+	"github.com/thegroove/trivial-auto-approve/internal/constants"
 	"github.com/thegroove/trivial-auto-approve/internal/errors"
 	"github.com/thegroove/trivial-auto-approve/internal/retry"
+	"github.com/thegroove/trivial-auto-approve/internal/security"
 	"google.golang.org/api/option"
 )
 
 // Client implements the API interface for Gemini operations.
 type Client struct {
-	client *genai.Client
-	model  *genai.GenerativeModel
-	debug  bool
+	client     *genai.Client
+	model      *genai.GenerativeModel
+	debug      bool
+	defense    *security.AIDefense
+	validator  *security.ResponseValidator
 }
 
-// ensure Client implements API interface
+// ensure Client implements API interface.
 var _ API = (*Client)(nil)
 
 // NewClient creates a new Gemini client with the specified model.
@@ -33,11 +38,7 @@ func NewClient(ctx context.Context, modelName string, debug bool) (*Client, erro
 
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		return nil, &errors.APIError{
-			Service: "Gemini",
-			Method:  "NewClient",
-			Err:     err,
-		}
+		return nil, errors.API("Gemini", "NewClient", err)
 	}
 
 	// Use the specified model
@@ -53,10 +54,46 @@ func NewClient(ctx context.Context, modelName string, debug bool) (*Client, erro
 	model.GenerationConfig.TopP = genai.Ptr[float32](0.1)          // Narrow sampling
 
 	return &Client{
-		client: client,
-		model:  model,
-		debug:  debug,
+		client:    client,
+		model:     model,
+		debug:     debug,
+		defense:   security.NewAIDefense(true), // Enable strict mode
+		validator: security.NewResponseValidator(),
 	}, nil
+}
+
+// AnalyzeText analyzes raw text for behavior changes (used by multi-model)
+func (c *Client) AnalyzeText(ctx context.Context, prompt string) (*AnalysisResult, error) {
+	// For simple text analysis, just use the prompt directly
+	// The defense mechanisms are already applied in AnalyzePRChanges
+	
+	// Generate content from the model
+	resp, err := c.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return nil, errors.API("Gemini", "GenerateContent", err)
+	}
+	
+	if len(resp.Candidates) == 0 {
+		return nil, fmt.Errorf("Gemini API returned no response candidates")
+	}
+
+	content := resp.Candidates[0].Content
+	if content == nil || len(content.Parts) == 0 {
+		return nil, fmt.Errorf("Gemini API returned empty response content")
+	}
+
+	text := fmt.Sprintf("%v", content.Parts[0])
+	
+	// Parse the response
+	result, err := parseAnalysisResponse(text)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Set default confidence
+	result.Confidence = 0.9 // Default high confidence
+	
+	return result, nil
 }
 
 // Close closes the Gemini client.
@@ -66,48 +103,74 @@ func (c *Client) Close() error {
 
 // AnalyzePRChanges analyzes PR changes to determine if they alter behavior.
 func (c *Client) AnalyzePRChanges(ctx context.Context, files []FileChange, prContext PRContext) (*AnalysisResult, error) {
-	prompt := buildAnalysisPrompt(files, prContext)
+	// Sanitize inputs before building prompt
+	sanitizedContext := c.sanitizePRContext(prContext)
+	sanitizedFiles := c.sanitizeFileChanges(files)
+	
+	// Check for security threats
+	if c.detectThreats(sanitizedContext, sanitizedFiles) {
+		log.Printf("[GEMINI] Security threat detected in PR content, returning conservative result")
+		return &AnalysisResult{
+			AltersBehavior:    true,
+			PossiblyMalicious: true,
+			Risky:            true,
+			Category:         "suspicious",
+			Reason:           "Security threat detected in PR content",
+		}, nil
+	}
+	
+	prompt := buildAnalysisPrompt(sanitizedFiles, sanitizedContext)
 
 	if c.debug {
-		fmt.Println("\n=== DEBUG: Gemini Request ===")
-		fmt.Println(prompt)
-		fmt.Println("=== END Gemini Request ===")
+		log.Println("\n=== DEBUG: Gemini Request Summary ===")
+		log.Printf("Prompt length: %d characters", len(prompt))
+		log.Printf("Number of files analyzed: %d", len(sanitizedFiles))
+		// Security: Don't log the full prompt in production as it contains code
+		// Only log first 200 chars for debugging if needed
+		if len(prompt) > 200 {
+			log.Printf("Prompt preview: %s...", prompt[:200])
+		} else {
+			log.Printf("Prompt preview: %s", prompt)
+		}
+		log.Println("=== END Gemini Request Summary ===")
 	}
 
 	var resp *genai.GenerateContentResponse
-	err := retry.Do(ctx, 10, func() error {
-		var err error
-		resp, err = c.model.GenerateContent(ctx, genai.Text(prompt))
-		if err != nil && retry.IsRetryable(err) {
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			var err error
+			resp, err = c.model.GenerateContent(ctx, genai.Text(prompt))
 			return err
-		} else if err != nil {
-			return &errors.APIError{
-				Service: "Gemini",
-				Method:  "GenerateContent",
-				Err:     err,
-			}
-		}
-		return nil
-	})
+		},
+		func(err error) error {
+			return errors.API("Gemini", "GenerateContent", err)
+		},
+	))
 	if err != nil {
 		return nil, err
 	}
 
 	if len(resp.Candidates) == 0 {
-		return nil, fmt.Errorf("no response candidates")
+		return nil, fmt.Errorf("Gemini API returned no response candidates for PR analysis")
 	}
 
 	content := resp.Candidates[0].Content
 	if content == nil || len(content.Parts) == 0 {
-		return nil, fmt.Errorf("empty response content")
+		return nil, fmt.Errorf("Gemini API returned empty response content for PR analysis")
 	}
 
 	text := fmt.Sprintf("%v", content.Parts[0])
 
 	if c.debug {
-		fmt.Println("\n=== DEBUG: Gemini Response ===")
-		fmt.Println(text)
-		fmt.Println("=== END Gemini Response ===")
+		log.Println("\n=== DEBUG: Gemini Response ===")
+		log.Println(text)
+		log.Println("=== END Gemini Response ===")
+	}
+
+	// Validate response structure
+	if err := c.validator.ValidateResponse(text); err != nil {
+		log.Printf("[GEMINI] Invalid response structure: %v", err)
+		return conservativeDefaults(err), nil
 	}
 
 	return parseAnalysisResponse(text)
@@ -123,19 +186,20 @@ type FileChange struct {
 
 // AnalysisResult represents the result of AI-powered PR analysis for behavior and triviality detection.
 type AnalysisResult struct {
+	Reason            string  // Analysis reason/explanation
+	Category          string  // "typo", "comment", "markdown", "lint", etc.
 	AltersBehavior    bool
-	NotImprovement    bool // True if change is NOT an improvement
-	Reason            string
-	NonTrivial        bool   // True if change is NOT trivial
-	Category          string // "typo", "comment", "markdown", "lint", etc.
-	Risky             bool   // True if change is high risk
-	InsecureChange    bool   // True if may introduce security problems
-	PossiblyMalicious bool   // True if change appears malicious
-	Superfluous       bool   // True if change is unnecessary/redundant
-	Vandalism         bool   // True if change is destructive/harmful
-	Confusing         bool   // True if change reduces clarity
-	TitleDescMismatch bool   // True if title/description doesn't match diff
-	MajorVersionBump  bool   // True if change includes major version bump
+	NotImprovement    bool    // True if change is NOT an improvement
+	NonTrivial        bool    // True if change is NOT trivial
+	Risky             bool    // True if change is high risk
+	InsecureChange    bool    // True if may introduce security problems
+	PossiblyMalicious bool    // True if change appears malicious
+	Superfluous       bool    // True if change is unnecessary/redundant
+	Vandalism         bool    // True if change is destructive/harmful
+	Confidence        float64 // Confidence level of the analysis (0.0-1.0)
+	Confusing         bool // True if change reduces clarity
+	TitleDescMismatch bool // True if title/description doesn't match diff
+	MajorVersionBump  bool // True if change includes major version bump
 }
 
 const systemPrompt = `You are a skeptical and critical software engineer analyzing open-source pull request changes for security and quality.
@@ -217,7 +281,7 @@ func buildAnalysisPrompt(files []FileChange, prContext PRContext) string {
 	return sb.String()
 }
 
-// buildManualPrompt creates prompt without template
+// buildManualPrompt creates prompt without template.
 func buildManualPrompt(files []FileChange, prContext PRContext) string {
 	var sb strings.Builder
 
@@ -259,7 +323,7 @@ Return ONLY the JSON object, no additional text.`)
 	return sb.String()
 }
 
-// jsonResponse is the structure we expect from Gemini
+// jsonResponse is the structure we expect from Gemini.
 type jsonResponse struct {
 	AltersBehavior    bool   `json:"alters_behavior"`
 	NotImprovement    bool   `json:"not_improvement"`
@@ -282,15 +346,15 @@ func parseAnalysisResponse(response string) (*AnalysisResult, error) {
 
 	// Try to parse JSON
 	var jsonResp jsonResponse
-	if err := json.Unmarshal([]byte(response), &jsonResp); err == nil {
-		return jsonResponseToResult(&jsonResp), nil
+	if err := json.Unmarshal([]byte(response), &jsonResp); err != nil {
+		// Return conservative defaults on parse failure
+		return conservativeDefaults(fmt.Errorf("failed to parse Gemini JSON response: %w", err)), nil
 	}
 
-	// Return conservative defaults on parse failure
-	return conservativeDefaults(fmt.Errorf("invalid JSON response")), nil
+	return jsonResponseToResult(&jsonResp), nil
 }
 
-// cleanJSONResponse removes markdown code blocks from response
+// cleanJSONResponse removes markdown code blocks from response.
 func cleanJSONResponse(response string) string {
 	response = strings.TrimSpace(response)
 
@@ -306,7 +370,7 @@ func cleanJSONResponse(response string) string {
 	return strings.TrimSpace(response)
 }
 
-// jsonResponseToResult converts JSON response to AnalysisResult
+// jsonResponseToResult converts JSON response to AnalysisResult.
 func jsonResponseToResult(resp *jsonResponse) *AnalysisResult {
 	return &AnalysisResult{
 		AltersBehavior:    resp.AltersBehavior,
@@ -325,7 +389,7 @@ func jsonResponseToResult(resp *jsonResponse) *AnalysisResult {
 	}
 }
 
-// conservativeDefaults returns safe defaults that will reject the PR
+// conservativeDefaults returns safe defaults that will reject the PR.
 func conservativeDefaults(err error) *AnalysisResult {
 	return &AnalysisResult{
 		AltersBehavior:    true,  // Assume it alters behavior
@@ -342,4 +406,74 @@ func conservativeDefaults(err error) *AnalysisResult {
 		Category:          "",    // No category = will be rejected
 		Reason:            fmt.Sprintf("Failed to parse Gemini response: %v", err),
 	}
+}
+
+// sanitizePRContext sanitizes PR context for security
+func (c *Client) sanitizePRContext(ctx PRContext) PRContext {
+	titleResult := c.defense.SanitizePRTitle(ctx.Title)
+	descResult := c.defense.SanitizePRDescription(ctx.Description)
+	
+	if titleResult.ThreatDetected || descResult.ThreatDetected {
+		log.Printf("[GEMINI] Security threats detected in PR metadata")
+		if titleResult.ThreatDetected {
+			log.Printf("[GEMINI]   Title: %v", titleResult.ThreatDetails)
+		}
+		if descResult.ThreatDetected {
+			log.Printf("[GEMINI]   Description: %v", descResult.ThreatDetails)
+		}
+	}
+	
+	return PRContext{
+		URL:               ctx.URL,
+		Title:             titleResult.Sanitized,
+		Description:       descResult.Sanitized,
+		Author:            ctx.Author,
+		AuthorAssociation: ctx.AuthorAssociation,
+		Organization:      ctx.Organization,
+		Repository:        ctx.Repository,
+	}
+}
+
+// sanitizeFileChanges sanitizes file changes for security
+func (c *Client) sanitizeFileChanges(files []FileChange) []FileChange {
+	sanitized := make([]FileChange, 0, len(files))
+	
+	for _, file := range files {
+		patchResult := c.defense.SanitizePatch(file.Patch, file.Filename)
+		
+		if patchResult.ThreatDetected {
+			log.Printf("[GEMINI] Security threat in patch for %s: %v", 
+				file.Filename, patchResult.ThreatDetails)
+		}
+		
+		sanitized = append(sanitized, FileChange{
+			Filename:  file.Filename,
+			Patch:     patchResult.Sanitized,
+			Additions: file.Additions,
+			Deletions: file.Deletions,
+		})
+	}
+	
+	return sanitized
+}
+
+// detectThreats checks if any sanitization detected threats
+func (c *Client) detectThreats(ctx PRContext, files []FileChange) bool {
+	// Re-check context for threats
+	titleResult := c.defense.SanitizePRTitle(ctx.Title)
+	descResult := c.defense.SanitizePRDescription(ctx.Description)
+	
+	if titleResult.ThreatDetected || descResult.ThreatDetected {
+		return true
+	}
+	
+	// Check patches
+	for _, file := range files {
+		patchResult := c.defense.SanitizePatch(file.Patch, file.Filename)
+		if patchResult.ThreatDetected {
+			return true
+		}
+	}
+	
+	return false
 }

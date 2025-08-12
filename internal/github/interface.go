@@ -10,11 +10,11 @@ import (
 // API defines the interface for GitHub API operations.
 // This interface enables testing by allowing mock implementations.
 type API interface {
-	// GetAuthenticatedUser retrieves the currently authenticated user.
-	GetAuthenticatedUser(ctx context.Context) (*github.User, error)
+	// AuthenticatedUser retrieves the currently authenticated user.
+	AuthenticatedUser(ctx context.Context) (*github.User, error)
 
-	// GetPullRequest retrieves a pull request by owner, repo, and number.
-	GetPullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error)
+	// PullRequest retrieves a pull request by owner, repo, and number.
+	PullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error)
 
 	// ListOrgPullRequests lists all open pull requests for an organization.
 	ListOrgPullRequests(ctx context.Context, org string) ([]*github.PullRequest, error)
@@ -22,11 +22,11 @@ type API interface {
 	// ListRepoPullRequests lists all open pull requests for a repository.
 	ListRepoPullRequests(ctx context.Context, owner, repo string) ([]*github.PullRequest, error)
 
-	// GetPullRequestFiles retrieves the files changed in a pull request.
-	GetPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error)
+	// PullRequestFiles retrieves the files changed in a pull request.
+	PullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error)
 
-	// GetCombinedStatus retrieves the combined status for a PR.
-	GetCombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error)
+	// CombinedStatus retrieves the combined status for a PR.
+	CombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error)
 
 	// ListCheckRunsForRef lists all check runs for a specific git ref.
 	ListCheckRunsForRef(ctx context.Context, owner, repo, ref string) ([]*github.CheckRun, error)
@@ -49,6 +49,18 @@ type API interface {
 	// MergePullRequest merges a pull request.
 	MergePullRequest(ctx context.Context, owner, repo string, number int) error
 
+	// GetUserPermissionLevel gets a user's permission level for a repository (admin, maintain, write, triage, read)
+	GetUserPermissionLevel(ctx context.Context, owner, repo, username string) (string, error)
+
 	// UpdateBranch updates the PR branch by rebasing or merging with the base branch.
 	UpdateBranch(ctx context.Context, owner, repo string, number int) error
+
+	// ListAppInstallations lists all installations for the GitHub App (only works with App authentication).
+	ListAppInstallations(ctx context.Context) ([]*github.Installation, error)
+
+	// ListUserRepositories lists repositories owned by a specific user (not org repos they have access to).
+	ListUserRepositories(ctx context.Context, user string) ([]*github.Repository, error)
+
+	// ListUserPullRequests lists all open pull requests for repositories owned by a specific user.
+	ListUserPullRequests(ctx context.Context, user string) ([]*github.PullRequest, error)
 }

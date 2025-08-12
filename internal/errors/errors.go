@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// Common sentinel errors
+// Common sentinel errors.
 var (
 	// ErrNoGitHubToken indicates that no GitHub authentication token was found.
 	ErrNoGitHubToken = errors.New("no GitHub token found")
@@ -56,22 +56,23 @@ func (e *APIError) Unwrap() error {
 	return e.Err
 }
 
-// AnalysisError represents an error during PR analysis.
-type AnalysisError struct {
-	PR     string
-	Reason string
-	Err    error
-}
-
-// Error implements the error interface.
-func (e *AnalysisError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("analysis error for PR %s: %s: %v", e.PR, e.Reason, e.Err)
+// API creates a new APIError.
+func API(service, method string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return fmt.Sprintf("analysis error for PR %s: %s", e.PR, e.Reason)
+	return &APIError{
+		Service: service,
+		Method:  method,
+		Err:     err,
+	}
 }
 
-// Unwrap returns the underlying error.
-func (e *AnalysisError) Unwrap() error {
-	return e.Err
+// Validation creates a new ValidationError.
+func Validation(field string, value interface{}, msg string) error {
+	return &ValidationError{
+		Field: field,
+		Value: value,
+		Msg:   msg,
+	}
 }

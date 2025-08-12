@@ -1,58 +1,90 @@
-// Package retry provides retry functionality with exponential backoff and jitter.
+// Package retry provides retry functionality with exponential backoff and jitter
+// using the codeGROOVE-dev/retry library for robust error handling.
 package retry
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"strings"
 	"time"
 
-	"github.com/avast/retry-go/v4"
+	"github.com/codeGROOVE-dev/retry"
 )
 
 // Do executes the given function with exponential backoff retry logic with jitter.
-// It will retry up to maxAttempts times with exponential backoff between attempts.
+// It will retry with exponential backoff up to 2 minutes.
 func Do(ctx context.Context, maxAttempts int, fn func() error) error {
+	if ctx == nil {
+		return fmt.Errorf("context cannot be nil")
+	}
+
+	if fn == nil {
+		return fmt.Errorf("function cannot be nil")
+	}
+
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 
-	opts := []retry.Option{
-		retry.Attempts(uint(maxAttempts)),
-		retry.Delay(250 * time.Millisecond),
-		retry.DelayType(retry.BackOffDelay),
-		retry.MaxJitter(100 * time.Millisecond), // Add jitter to prevent thundering herd
+	// Ensure maxAttempts doesn't cause overflow
+	if maxAttempts > 100 {
+		maxAttempts = 100
+	}
+
+	// Configure retry with exponential backoff and jitter, waiting up to 2 minutes
+	err := retry.Do(
+		func() error {
+			// Log each attempt for debugging
+			log.Printf("[RETRY] Attempting operation...")
+			return fn()
+		},
 		retry.Context(ctx),
+		retry.Attempts(uint(maxAttempts)),
+		retry.Delay(250*time.Millisecond),
+		retry.MaxDelay(2*time.Minute), // Wait up to 2 minutes as specified
+		retry.DelayType(retry.BackOffDelay),
+		retry.MaxJitter(5*time.Second), // Increase jitter for longer delays
+		retry.LastErrorOnly(true),
 		retry.RetryIf(func(err error) bool {
-			// Only retry if the error is retryable
-			return IsRetryable(err)
+			retryable := IsRetryable(err)
+			if retryable {
+				log.Printf("[RETRY] Retryable error encountered: %v", err)
+			} else {
+				log.Printf("[RETRY] Non-retryable error encountered: %v", err)
+			}
+			return retryable
 		}),
 		retry.OnRetry(func(n uint, err error) {
-			// Optional: could add logging here if needed
-			// log.Printf("Retry attempt %d after error: %v", n, err)
+			log.Printf("[RETRY] Attempt %d/%d failed: %v", n+1, maxAttempts, err)
 		}),
+	)
+	if err != nil {
+		return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, err)
 	}
 
-	return retry.Do(fn, opts...)
+	log.Printf("[RETRY] Operation succeeded")
+	return nil
 }
 
-// DoWithOptions executes the given function with custom retry options.
-// This allows fine-tuning retry behavior for specific use cases.
-func DoWithOptions(fn func() error, opts ...retry.Option) error {
-	// Set default options that can be overridden
-	defaultOpts := []retry.Option{
-		retry.Attempts(10),
-		retry.Delay(250 * time.Millisecond),
-		retry.DelayType(retry.BackOffDelay),
-		retry.MaxJitter(100 * time.Millisecond),
-		retry.RetryIf(func(err error) bool {
-			return IsRetryable(err)
-		}),
+// WithRetryableCheck wraps a function to handle retryable errors distinctly.
+// If the error is retryable, it returns it as-is for retry.Do to handle.
+// If not retryable, it wraps the error with the provided wrapper function.
+func WithRetryableCheck(fn func() error, wrapNonRetryable func(error) error) func() error {
+	return func() error {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if IsRetryable(err) {
+			log.Printf("[RETRY] Retryable error detected: %v", err)
+			return err // Let retry.Do handle it
+		}
+		// Non-retryable error, wrap it
+		log.Printf("[RETRY] Non-retryable error detected, wrapping: %v", err)
+		return wrapNonRetryable(err)
 	}
-
-	// Append custom options (which will override defaults)
-	allOpts := append(defaultOpts, opts...)
-
-	return retry.Do(fn, allOpts...)
 }
 
 // IsRetryable determines if an error should be retried.
@@ -63,13 +95,13 @@ func IsRetryable(err error) bool {
 	}
 
 	// Check if context was cancelled - don't retry in this case
-	if err == context.Canceled || err == context.DeadlineExceeded {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
 	// Add specific error checks here based on your needs
 	// For now, we'll consider network errors and timeouts as retryable
-	errStr := err.Error()
+	errStr := strings.ToLower(err.Error())
 	retryableErrors := []string{
 		"connection refused",
 		"timeout",
@@ -82,11 +114,14 @@ func IsRetryable(err error) bool {
 		"i/o timeout",
 		"network is unreachable",
 		"no such host",
-		"EOF",
+		"eof",
+		"connection reset",
+		"broken pipe",
+		"resource temporarily unavailable",
 	}
 
 	for _, retryable := range retryableErrors {
-		if containsIgnoreCase(errStr, retryable) {
+		if strings.Contains(errStr, retryable) {
 			return true
 		}
 	}
@@ -99,6 +134,7 @@ func IsRetryable(err error) bool {
 		"502", // Bad Gateway
 		"503", // Service Unavailable
 		"504", // Gateway Timeout
+		"408", // Request Timeout
 	}
 
 	for _, code := range httpRetryableCodes {
@@ -114,12 +150,16 @@ func IsRetryable(err error) bool {
 		return true
 	}
 
+	// Handle Gemini API specific errors
+	if strings.Contains(errStr, "gemini") || strings.Contains(errStr, "generativeai") {
+		// Retry on quota exceeded or overloaded
+		if strings.Contains(errStr, "quota") ||
+			strings.Contains(errStr, "capacity") ||
+			strings.Contains(errStr, "overloaded") {
+			return true
+		}
+	}
+
 	return false
 }
 
-// containsIgnoreCase checks if s contains substr, case-insensitive
-func containsIgnoreCase(s, substr string) bool {
-	s = strings.ToLower(s)
-	substr = strings.ToLower(substr)
-	return strings.Contains(s, substr)
-}

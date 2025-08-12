@@ -178,7 +178,7 @@ func TestParseAnalysisResponse(t *testing.T) {
 				Confusing:         true,
 				TitleDescMismatch: true,
 				MajorVersionBump:  true,
-				Reason:            "Failed to parse Gemini response: invalid JSON response",
+				Reason:            "Failed to parse Gemini response: failed to parse Gemini JSON response: invalid character 'T' looking for beginning of value",
 			},
 		},
 	}

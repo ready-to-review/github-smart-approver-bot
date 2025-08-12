@@ -3,8 +3,10 @@ package github
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v68/github"
 	"github.com/shurcooL/githubv4"
@@ -18,11 +20,12 @@ import (
 type Client struct {
 	client   *github.Client
 	clientV4 *githubv4.Client
+	appAuth  *AppAuth // Optional: set when using GitHub App authentication
 }
 
 // NewClient creates a new GitHub client using the gh CLI token.
 func NewClient(ctx context.Context) (*Client, error) {
-	token, err := getGHToken()
+	token, err := getGHToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -38,32 +41,30 @@ func NewClient(ctx context.Context) (*Client, error) {
 	}, nil
 }
 
-// ensure Client implements API interface
+// ensure Client implements API interface.
 var _ API = (*Client)(nil)
 
-// GetAuthenticatedUser retrieves the currently authenticated user.
-func (c *Client) GetAuthenticatedUser(ctx context.Context) (*github.User, error) {
+// AuthenticatedUser retrieves the currently authenticated user.
+func (c *Client) AuthenticatedUser(ctx context.Context) (*github.User, error) {
 	user, _, err := c.client.Users.Get(ctx, "")
 	if err != nil {
-		return nil, &errors.APIError{
-			Service: "GitHub",
-			Method:  "Users.Get",
-			Err:     err,
-		}
+		return nil, errors.API("GitHub", "Users.Get", err)
 	}
 	return user, nil
 }
 
 // getGHToken retrieves the GitHub token using gh CLI.
-func getGHToken() (string, error) {
-	cmd := exec.Command("gh", "auth", "token")
+func getGHToken(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", &errors.APIError{
-			Service: "gh CLI",
-			Method:  "auth token",
-			Err:     err,
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("gh auth token timed out: %w", ctx.Err())
 		}
+		return "", errors.API("gh CLI", "auth token", err)
 	}
 
 	token := strings.TrimSpace(string(out))
@@ -74,39 +75,60 @@ func getGHToken() (string, error) {
 	return token, nil
 }
 
-// GetPullRequest retrieves a pull request by owner, repo, and number.
-func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error) {
-	var pr *github.PullRequest
-	err := retry.Do(ctx, 10, func() error {
-		var err error
-		pr, _, err = c.client.PullRequests.Get(ctx, owner, repo, number)
-		if err != nil && retry.IsRetryable(err) {
-			return err
-		} else if err != nil {
-			// Non-retryable error, wrap and return
-			return &errors.APIError{
-				Service: "GitHub",
-				Method:  fmt.Sprintf("GetPullRequest %s/%s#%d", owner, repo, number),
-				Err:     err,
-			}
+// withTimeout wraps a context with a timeout for API calls.
+func withTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		// If parent context already has a deadline, use the earlier one
+		if time.Until(deadline) < timeout {
+			return ctx, func() {} // no-op cancel
 		}
-		return nil
-	})
-	return pr, err
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+// PullRequest retrieves a pull request by owner, repo, and number.
+func (c *Client) PullRequest(ctx context.Context, owner, repo string, number int) (*github.PullRequest, error) {
+	// Input validation
+	if owner == "" || repo == "" {
+		return nil, fmt.Errorf("owner and repo cannot be empty")
+	}
+	if number <= 0 {
+		return nil, fmt.Errorf("invalid PR number: %d", number)
+	}
+	
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var pr *github.PullRequest
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			var err error
+			pr, _, err = c.client.PullRequests.Get(ctx, owner, repo, number)
+			return err
+		},
+		func(err error) error {
+			return errors.API("GitHub", fmt.Sprintf("PullRequest %s/%s#%d", owner, repo, number), err)
+		},
+	))
+	if err != nil {
+		return pr, fmt.Errorf("failed to get pull request after retries: %w", err)
+	}
+	return pr, nil
 }
 
 // ListOrgPullRequests lists all open pull requests for an organization or user.
 // Note: This uses the Search API which returns limited PR data. The analyzer
 // will need to fetch full PR details when needed.
 func (c *Client) ListOrgPullRequests(ctx context.Context, org string) ([]*github.PullRequest, error) {
+	// Add timeout for this potentially long operation
+	ctx, cancel := withTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
 	// First, check if this is an organization or a user
 	user, _, err := c.client.Users.Get(ctx, org)
 	if err != nil {
-		return nil, &errors.APIError{
-			Service: "GitHub",
-			Method:  "Users.Get",
-			Err:     err,
-		}
+		return nil, errors.API("GitHub", "Users.Get", err)
 	}
 
 	opt := &github.SearchOptions{
@@ -127,11 +149,7 @@ func (c *Client) ListOrgPullRequests(ctx context.Context, org string) ([]*github
 	for {
 		result, resp, err := c.client.Search.Issues(ctx, query, opt)
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "Search.Issues",
-				Err:     err,
-			}
+			return nil, errors.API("GitHub", "Search.Issues", err)
 		}
 
 		// Convert search results to minimal PR objects
@@ -177,19 +195,30 @@ func (c *Client) ListOrgPullRequests(ctx context.Context, org string) ([]*github
 	return allPRs, nil
 }
 
-// GetPullRequestFiles retrieves the files changed in a pull request.
-func (c *Client) GetPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error) {
+// PullRequestFiles retrieves the files changed in a pull request.
+func (c *Client) PullRequestFiles(ctx context.Context, owner, repo string, number int) ([]*github.CommitFile, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	opt := &github.ListOptions{PerPage: constants.GitHubAPIPageSize}
 	var allFiles []*github.CommitFile
 
 	for {
-		files, resp, err := c.client.PullRequests.ListFiles(ctx, owner, repo, number, opt)
+		var files []*github.CommitFile
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				files, resp, err = c.client.PullRequests.ListFiles(ctx, owner, repo, number, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "PullRequests.ListFiles", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "PullRequests.ListFiles",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list PR files after retries: %w", err)
 		}
 
 		allFiles = append(allFiles, files...)
@@ -203,28 +232,28 @@ func (c *Client) GetPullRequestFiles(ctx context.Context, owner, repo string, nu
 	return allFiles, nil
 }
 
-// GetCombinedStatus retrieves the combined status for a PR.
-func (c *Client) GetCombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error) {
+// CombinedStatus retrieves the combined status for a PR.
+func (c *Client) CombinedStatus(ctx context.Context, owner, repo, ref string) (*github.CombinedStatus, error) {
 	var status *github.CombinedStatus
-	err := retry.Do(ctx, 10, func() error {
-		var err error
-		status, _, err = c.client.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
-		if err != nil && retry.IsRetryable(err) {
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			var err error
+			status, _, err = c.client.Repositories.GetCombinedStatus(ctx, owner, repo, ref, nil)
 			return err
-		} else if err != nil {
-			return &errors.APIError{
-				Service: "GitHub",
-				Method:  "Repositories.GetCombinedStatus",
-				Err:     err,
-			}
-		}
-		return nil
-	})
+		},
+		func(err error) error {
+			return errors.API("GitHub", "Repositories.GetCombinedStatus", err)
+		},
+	))
 	return status, err
 }
 
 // ListCheckRunsForRef lists all check runs for a specific git ref.
 func (c *Client) ListCheckRunsForRef(ctx context.Context, owner, repo, ref string) ([]*github.CheckRun, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	opt := &github.ListCheckRunsOptions{
 		ListOptions: github.ListOptions{
 			PerPage: constants.GitHubAPIPageSize,
@@ -233,13 +262,20 @@ func (c *Client) ListCheckRunsForRef(ctx context.Context, owner, repo, ref strin
 
 	var allCheckRuns []*github.CheckRun
 	for {
-		result, resp, err := c.client.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, opt)
+		var result *github.ListCheckRunsResults
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				result, resp, err = c.client.Checks.ListCheckRunsForRef(ctx, owner, repo, ref, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "Checks.ListCheckRunsForRef", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "Checks.ListCheckRunsForRef",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list check runs after retries: %w", err)
 		}
 
 		if result != nil && result.CheckRuns != nil {
@@ -257,18 +293,26 @@ func (c *Client) ListCheckRunsForRef(ctx context.Context, owner, repo, ref strin
 
 // ApprovePullRequest approves a pull request.
 func (c *Client) ApprovePullRequest(ctx context.Context, owner, repo string, number int, body string) error {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	review := &github.PullRequestReviewRequest{
 		Body:  github.String(body),
 		Event: github.String(constants.ReviewEventApprove),
 	}
 
-	_, _, err := c.client.PullRequests.CreateReview(ctx, owner, repo, number, review)
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			_, _, err := c.client.PullRequests.CreateReview(ctx, owner, repo, number, review)
+			return err
+		},
+		func(err error) error {
+			return errors.API("GitHub", "PullRequests.CreateReview", err)
+		},
+	))
 	if err != nil {
-		return &errors.APIError{
-			Service: "GitHub",
-			Method:  "PullRequests.CreateReview",
-			Err:     err,
-		}
+		return fmt.Errorf("failed to approve PR after retries: %w", err)
 	}
 
 	return nil
@@ -277,7 +321,7 @@ func (c *Client) ApprovePullRequest(ctx context.Context, owner, repo string, num
 // EnableAutoMerge enables auto-merge for a pull request.
 func (c *Client) EnableAutoMerge(ctx context.Context, owner, repo string, number int) error {
 	// First, get the PR to check if auto-merge is already enabled
-	pr, err := c.GetPullRequest(ctx, owner, repo, number)
+	pr, err := c.PullRequest(ctx, owner, repo, number)
 	if err != nil {
 		return fmt.Errorf("getting PR for auto-merge: %w", err)
 	}
@@ -296,7 +340,7 @@ func (c *Client) EnableAutoMerge(ctx context.Context, owner, repo string, number
 
 	// Get the PR node ID for GraphQL
 	if pr.NodeID == nil {
-		return fmt.Errorf("pr node ID not available")
+		return fmt.Errorf("GitHub PR missing node ID required for GraphQL operations (owner=%s, repo=%s, number=%d)", owner, repo, number)
 	}
 
 	// GraphQL mutation to enable auto-merge
@@ -321,29 +365,67 @@ func (c *Client) EnableAutoMerge(ctx context.Context, owner, repo string, number
 		if strings.Contains(errStr, "Pull request is in clean status") {
 			return errors.ErrPRReadyToMerge
 		}
-		return &errors.APIError{
-			Service: "GitHub GraphQL",
-			Method:  "enablePullRequestAutoMerge",
-			Err:     err,
-		}
+		return errors.API("GitHub GraphQL", "enablePullRequestAutoMerge", err)
 	}
 
 	return nil
 }
 
+// GetUserPermissionLevel gets a user's permission level for a repository
+func (c *Client) GetUserPermissionLevel(ctx context.Context, owner, repo, username string) (string, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	var permission string
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			// Use GitHub API to get repository permissions for user
+			perm, _, err := c.client.Repositories.GetPermissionLevel(ctx, owner, repo, username)
+			if err != nil {
+				return err
+			}
+			
+			if perm == nil || perm.Permission == nil {
+				return fmt.Errorf("no permission data returned")
+			}
+			
+			permission = *perm.Permission
+			return nil
+		},
+		func(err error) error {
+			return errors.API("GitHub", "GetPermissionLevel", err)
+		},
+	))
+	
+	if err != nil {
+		return "", errors.API("GitHub", fmt.Sprintf("GetPermissionLevel(%s/%s, %s)", owner, repo, username), err)
+	}
+	
+	return permission, nil
+}
+
 // MergePullRequest merges a pull request.
 func (c *Client) MergePullRequest(ctx context.Context, owner, repo string, number int) error {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	mergeOpts := &github.PullRequestOptions{
 		MergeMethod: "squash",
 	}
 
-	_, _, err := c.client.PullRequests.Merge(ctx, owner, repo, number, "", mergeOpts)
+	err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			_, _, err := c.client.PullRequests.Merge(ctx, owner, repo, number, "", mergeOpts)
+			return err
+		},
+		func(err error) error {
+			return errors.API("GitHub", "PullRequests.Merge", err)
+		},
+	))
 	if err != nil {
-		return &errors.APIError{
-			Service: "GitHub",
-			Method:  "PullRequests.Merge",
-			Err:     err,
-		}
+		return fmt.Errorf("failed to merge PR after retries: %w", err)
 	}
 
 	return nil
@@ -351,17 +433,28 @@ func (c *Client) MergePullRequest(ctx context.Context, owner, repo string, numbe
 
 // ListReviews lists all reviews for a pull request.
 func (c *Client) ListReviews(ctx context.Context, owner, repo string, number int) ([]*github.PullRequestReview, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	opt := &github.ListOptions{PerPage: constants.GitHubAPIPageSize}
 	var allReviews []*github.PullRequestReview
 
 	for {
-		reviews, resp, err := c.client.PullRequests.ListReviews(ctx, owner, repo, number, opt)
+		var reviews []*github.PullRequestReview
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				reviews, resp, err = c.client.PullRequests.ListReviews(ctx, owner, repo, number, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "PullRequests.ListReviews", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "PullRequests.ListReviews",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list reviews after retries: %w", err)
 		}
 
 		allReviews = append(allReviews, reviews...)
@@ -377,19 +470,30 @@ func (c *Client) ListReviews(ctx context.Context, owner, repo string, number int
 
 // ListIssueComments lists all issue comments for a pull request.
 func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]*github.IssueComment, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	opt := &github.IssueListCommentsOptions{
 		ListOptions: github.ListOptions{PerPage: constants.GitHubAPIPageSize},
 	}
 	var allComments []*github.IssueComment
 
 	for {
-		comments, resp, err := c.client.Issues.ListComments(ctx, owner, repo, number, opt)
+		var comments []*github.IssueComment
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				comments, resp, err = c.client.Issues.ListComments(ctx, owner, repo, number, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "Issues.ListComments", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "Issues.ListComments",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list issue comments after retries: %w", err)
 		}
 
 		allComments = append(allComments, comments...)
@@ -405,19 +509,30 @@ func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, numb
 
 // ListPullRequestComments lists all PR review comments for a pull request.
 func (c *Client) ListPullRequestComments(ctx context.Context, owner, repo string, number int) ([]*github.PullRequestComment, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	opt := &github.PullRequestListCommentsOptions{
 		ListOptions: github.ListOptions{PerPage: constants.GitHubAPIPageSize},
 	}
 	var allComments []*github.PullRequestComment
 
 	for {
-		comments, resp, err := c.client.PullRequests.ListComments(ctx, owner, repo, number, opt)
+		var comments []*github.PullRequestComment
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				comments, resp, err = c.client.PullRequests.ListComments(ctx, owner, repo, number, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "PullRequests.ListComments", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "PullRequests.ListComments",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list PR comments after retries: %w", err)
 		}
 
 		allComments = append(allComments, comments...)
@@ -433,6 +548,10 @@ func (c *Client) ListPullRequestComments(ctx context.Context, owner, repo string
 
 // ListRepoPullRequests lists all open pull requests for a repository.
 func (c *Client) ListRepoPullRequests(ctx context.Context, owner, repo string) ([]*github.PullRequest, error) {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
 	opt := &github.PullRequestListOptions{
 		State: constants.PRStateOpen,
 		ListOptions: github.ListOptions{
@@ -442,13 +561,20 @@ func (c *Client) ListRepoPullRequests(ctx context.Context, owner, repo string) (
 
 	var allPRs []*github.PullRequest
 	for {
-		prs, resp, err := c.client.PullRequests.List(ctx, owner, repo, opt)
+		var prs []*github.PullRequest
+		var resp *github.Response
+		err := retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+			func() error {
+				var err error
+				prs, resp, err = c.client.PullRequests.List(ctx, owner, repo, opt)
+				return err
+			},
+			func(err error) error {
+				return errors.API("GitHub", "PullRequests.List", err)
+			},
+		))
 		if err != nil {
-			return nil, &errors.APIError{
-				Service: "GitHub",
-				Method:  "PullRequests.List",
-				Err:     err,
-			}
+			return nil, fmt.Errorf("failed to list repo PRs after retries: %w", err)
 		}
 
 		allPRs = append(allPRs, prs...)
@@ -464,8 +590,12 @@ func (c *Client) ListRepoPullRequests(ctx context.Context, owner, repo string) (
 
 // UpdateBranch updates the PR branch by rebasing or merging with the base branch.
 func (c *Client) UpdateBranch(ctx context.Context, owner, repo string, number int) error {
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
 	// First, get the PR to check if it needs updating
-	pr, err := c.GetPullRequest(ctx, owner, repo, number)
+	pr, err := c.PullRequest(ctx, owner, repo, number)
 	if err != nil {
 		return fmt.Errorf("getting PR for branch update: %w", err)
 	}
@@ -476,21 +606,137 @@ func (c *Client) UpdateBranch(ctx context.Context, owner, repo string, number in
 		return errors.ErrBranchUpToDate
 	}
 
-	// Update the branch using the GitHub API
-	_, _, err = c.client.PullRequests.UpdateBranch(ctx, owner, repo, number, nil)
+	// Update the branch using the GitHub API with retry
+	err = retry.Do(ctx, constants.MaxRetryAttempts, retry.WithRetryableCheck(
+		func() error {
+			_, _, err := c.client.PullRequests.UpdateBranch(ctx, owner, repo, number, nil)
+			return err
+		},
+		func(err error) error {
+			// Check if the error indicates the branch is already up to date
+			if strings.Contains(err.Error(), "already up to date") {
+				return errors.ErrBranchUpToDate
+			}
+			return errors.API("GitHub", "PullRequests.UpdateBranch", err)
+		},
+	))
 	if err != nil {
-		// Check if the error indicates the branch is already up to date
-		if strings.Contains(err.Error(), "already up to date") {
-			return errors.ErrBranchUpToDate
-		}
-		return &errors.APIError{
-			Service: "GitHub",
-			Method:  "PullRequests.UpdateBranch",
-			Err:     err,
-		}
+		return fmt.Errorf("failed to update branch after retries: %w", err)
 	}
 
 	return nil
+}
+
+// ListAppInstallations lists all installations for the GitHub App.
+// This method only works when using GitHub App authentication.
+func (c *Client) ListAppInstallations(ctx context.Context) ([]*github.Installation, error) {
+	if c.appAuth == nil {
+		return nil, fmt.Errorf("ListAppInstallations requires GitHub App authentication")
+	}
+
+	return c.appAuth.ListInstallations(ctx)
+}
+
+// AppAuth returns the GitHub App authenticator if available.
+func (c *Client) AppAuth() *AppAuth {
+	return c.appAuth
+}
+
+// ListUserRepositories lists repositories owned by a specific user.
+// This only returns repositories where the user is the owner, not repositories
+// from organizations they belong to.
+func (c *Client) ListUserRepositories(ctx context.Context, user string) ([]*github.Repository, error) {
+	// Input validation
+	if user == "" {
+		return nil, fmt.Errorf("user cannot be empty")
+	}
+
+	// Add timeout for this operation
+	ctx, cancel := withTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var allRepos []*github.Repository
+	opt := &github.RepositoryListOptions{
+		Type:        "owner", // Only repos owned by the user
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		repos, resp, err := c.client.Repositories.List(ctx, user, opt)
+		if err != nil {
+			return nil, errors.API("GitHub", "Repositories.List", err)
+		}
+
+		allRepos = append(allRepos, repos...)
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return allRepos, nil
+}
+
+// ListUserPullRequests lists all open pull requests for repositories owned by a specific user.
+// This only includes PRs from repositories where the user is the owner.
+func (c *Client) ListUserPullRequests(ctx context.Context, user string) ([]*github.PullRequest, error) {
+	// Input validation
+	if user == "" {
+		return nil, fmt.Errorf("user cannot be empty")
+	}
+
+	// First, get all repositories owned by the user
+	repos, err := c.ListUserRepositories(ctx, user)
+	if err != nil {
+		return nil, fmt.Errorf("listing user repositories: %w", err)
+	}
+	
+	log.Printf("[GITHUB] Found %d repositories for user %s", len(repos), user)
+
+	// Add timeout for PR fetching operations
+	ctx, cancel := withTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	var allPRs []*github.PullRequest
+
+	// For each repository, list open pull requests
+	// Limit to avoid overwhelming the API with too many requests
+	for _, repo := range repos {
+		if repo.Name == nil {
+			continue
+		}
+		
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			return allPRs, ctx.Err()
+		default:
+		}
+
+		opt := &github.PullRequestListOptions{
+			State:       "open",
+			ListOptions: github.ListOptions{PerPage: 100},
+		}
+
+		for {
+			prs, resp, err := c.client.PullRequests.List(ctx, user, *repo.Name, opt)
+			if err != nil {
+				// Skip this repo if we can't list PRs (might be disabled, archived, etc.)
+				// Continue with other repos
+				break
+			}
+
+			allPRs = append(allPRs, prs...)
+
+			if resp.NextPage == 0 {
+				break
+			}
+			opt.Page = resp.NextPage
+		}
+	}
+
+	return allPRs, nil
 }
 
 // ParsePullRequestURL parses a GitHub PR URL and returns owner, repo, and number.
@@ -499,11 +745,13 @@ func (c *Client) UpdateBranch(ctx context.Context, owner, repo string, number in
 //   - owner/repo#123
 func ParsePullRequestURL(url string) (owner, repo string, number int, err error) {
 	if url == "" {
-		return "", "", 0, &errors.ValidationError{
-			Field: "url",
-			Value: url,
-			Msg:   "empty URL",
-		}
+		return "", "", 0, errors.Validation("url", url, "empty URL")
+	}
+	
+	// Limit URL length to prevent abuse
+	const maxURLLength = 500
+	if len(url) > maxURLLength {
+		return "", "", 0, errors.Validation("url", url, fmt.Sprintf("URL exceeds maximum length of %d", maxURLLength))
 	}
 
 	if strings.Contains(url, "github.com") {
@@ -515,11 +763,7 @@ func ParsePullRequestURL(url string) (owner, repo string, number int, err error)
 		repo = parts[4]
 		_, err = fmt.Sscanf(parts[6], "%d", &number)
 		if err != nil {
-			return "", "", 0, &errors.ValidationError{
-				Field: "url",
-				Value: parts[6],
-				Msg:   "invalid PR number",
-			}
+			return "", "", 0, errors.Validation("url", parts[6], "invalid PR number")
 		}
 	} else if strings.Contains(url, "#") {
 		parts := strings.Split(url, "#")
@@ -529,26 +773,62 @@ func ParsePullRequestURL(url string) (owner, repo string, number int, err error)
 
 		repoParts := strings.Split(parts[0], "/")
 		if len(repoParts) != 2 {
-			return "", "", 0, &errors.ValidationError{
-				Field: "url",
-				Value: url,
-				Msg:   "expected owner/repo format",
-			}
+			return "", "", 0, errors.Validation("url", url, "expected owner/repo format")
 		}
 
 		owner = repoParts[0]
 		repo = repoParts[1]
 		_, err = fmt.Sscanf(parts[1], "%d", &number)
 		if err != nil {
-			return "", "", 0, &errors.ValidationError{
-				Field: "url",
-				Value: parts[1],
-				Msg:   "invalid PR number",
-			}
+			return "", "", 0, errors.Validation("url", parts[1], "invalid PR number")
 		}
 	} else {
 		return "", "", 0, errors.ErrInvalidPRURL
 	}
 
+	// Security: Validate owner and repo names to prevent injection
+	if !isValidGitHubName(owner) {
+		return "", "", 0, errors.Validation("owner", owner, "invalid owner name format")
+	}
+	if !isValidGitHubName(repo) {
+		return "", "", 0, errors.Validation("repo", repo, "invalid repository name format")
+	}
+	
+	// Security: Validate PR number is reasonable
+	if number <= 0 || number > 999999999 {
+		return "", "", 0, errors.Validation("number", fmt.Sprintf("%d", number), "PR number out of valid range")
+	}
+
 	return owner, repo, number, nil
+}
+
+// isValidGitHubName validates GitHub owner/repo names according to GitHub's rules
+// GitHub names can contain alphanumeric characters, hyphens, periods, and underscores
+// but cannot start with a hyphen or period
+func isValidGitHubName(name string) bool {
+	if name == "" {
+		return false
+	}
+	
+	// Length limits based on GitHub's constraints
+	if len(name) > 100 {
+		return false
+	}
+	
+	// Cannot start with hyphen or period
+	if name[0] == '-' || name[0] == '.' {
+		return false
+	}
+	
+	// Check each character
+	for _, char := range name {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.') {
+			return false
+		}
+	}
+	
+	return true
 }

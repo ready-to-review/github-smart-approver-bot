@@ -10,11 +10,14 @@ go install github.com/thegroove/trivial-auto-approve/cmd/auto-approve@latest
 
 ## Prerequisites
 
-- **GitHub CLI**: `gh auth login`
+- **Authentication** (choose one):
+  - **GitHub CLI**: `gh auth login` (default)
+  - **GitHub App**: Create app with PR write permissions (production)
 - **Gemini API key**: `export GEMINI_API_KEY=your-api-key` ([Get key](https://aistudio.google.com/app/apikey))
 
 ## Usage
 
+### Using GitHub CLI (default)
 ```bash
 # Single PR
 auto-approve --pr owner/repo#123
@@ -24,9 +27,22 @@ auto-approve --project owner/repo --poll 1h
 
 # Organization-wide
 auto-approve --org myorg --dry-run
+```
 
-# Full automation
-auto-approve --project owner/repo --poll 30m --auto-rebase --auto-merge
+### Using GitHub App (production)
+```bash
+# Single PR with GitHub App
+auto-approve \
+  --app-id 123456 \
+  --app-key /path/to/private-key.pem \
+  --pr owner/repo#123
+
+# Full automation with GitHub App
+auto-approve \
+  --app-id 123456 \
+  --app-key /path/to/private-key.pem \
+  --project owner/repo \
+  --poll 30m --auto-rebase --auto-merge
 ```
 
 ## Safety Checks
@@ -52,7 +68,10 @@ PRs are auto-approved only when **ALL** conditions are met:
 | `--auto-merge` | Enable auto-merge | false |
 | `--auto-rebase` | Update branches | false |
 | `--max-files N` | File limit | 5 |
-| `--no-gemini` | Disable AI analysis | false |
+| `--model ""` | Disable AI analysis | gemini-2.0-flash |
+| `--app-id N` | GitHub App ID | - |
+| `--app-key path` | Path to private key | - |
+| `--installation-id N` | Installation ID | auto-detect |
 
 ## What Gets Approved
 
@@ -68,10 +87,37 @@ PRs are auto-approved only when **ALL** conditions are met:
 
 ## Security
 
-- Uses GitHub CLI token (never stored)
-- Conservative defaults prioritize safety
-- All actions logged and traceable
-- Respects existing review processes
+- **Authentication**: GitHub CLI token or GitHub App JWT (never stored)
+- **GitHub App**: More secure for production with scoped permissions
+- **Conservative**: Safety-first defaults, requires all checks to pass
+- **Auditable**: All actions logged and traceable
+- **Respectful**: Won't override existing reviews or comments
+
+## GitHub App Setup
+
+1. **Create a GitHub App**:
+   - Go to Settings → Developer settings → GitHub Apps → New GitHub App
+   - Set permissions:
+     - Pull requests: Read & Write
+     - Contents: Read
+     - Checks: Read
+     - Metadata: Read
+
+2. **Generate private key**:
+   - In your app settings, generate and download a private key
+   - Save as `private-key.pem`
+
+3. **Install the app**:
+   - Install on your repository or organization
+   - Note the installation ID (visible in the URL)
+
+4. **Use with auto-approve**:
+   ```bash
+   auto-approve \
+     --app-id YOUR_APP_ID \
+     --app-key ./private-key.pem \
+     --pr owner/repo#123
+   ```
 
 ## Building
 

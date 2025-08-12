@@ -3,7 +3,7 @@ package gemini
 
 import "context"
 
-// PRContext contains context information about a pull request
+// PRContext contains context information about a pull request.
 type PRContext struct {
 	Title             string
 	Description       string
